@@ -98,60 +98,60 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-          # 1. 注入官方 PassWall 2 源码 (替换旧版 PassWall 1)
-          rm -rf package/feeds/luci/luci-app-passwall package/luci-app-passwall
-          rm -rf package/feeds/luci/luci-app-passwall2 package/luci-app-passwall2
-          git clone --depth=1 https://github.com/Openwrt-Passwall/openwrt-passwall2.git package/luci-app-passwall2
+          # 注入 Mihomo 内核（OpenClash 的 feeds 包只带界面与脚本，不含核心二进制）
+          # 与上一版注入 Xray 的做法一致：直接取官方预编译产物，绕开 Go 工具链。
+          MIHOMO_TAG=$(curl -sL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -r '.tag_name // empty')
+          if [ -z "$MIHOMO_TAG" ]; then
+            MIHOMO_TAG="v1.19.32"
+            echo "::warning::GitHub API 未返回最新 tag，回退到 ${MIHOMO_TAG}"
+          fi
+          MIHOMO_VER="${MIHOMO_TAG#v}"
+          echo "检测到 Mihomo 官方最新版本: ${MIHOMO_VER}"
 
-          # 2. 注入最新版本 Xray 二进制（彻底绕过 Go 编译器冲突，确保 tunnel 入站支持）
-          LATEST_XRAY_TAG=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r '.tag_name' || echo "v25.10.15")
-          XRAY_VER="${LATEST_XRAY_TAG#v}"
-          echo "检测到 Xray 官方最新版本: ${XRAY_VER}"
+          PKG_DIR=package/openclash-core
+          rm -rf "$PKG_DIR"
+          mkdir -p "$PKG_DIR"
 
-          XRAY_PKG_DIR=package/xray-core
-          rm -rf feeds/packages/net/xray-core package/feeds/packages/xray-core "$XRAY_PKG_DIR"
-          mkdir -p "$XRAY_PKG_DIR"
-
-          cat << EOF > "$XRAY_PKG_DIR/Makefile"
+          cat << EOF > "$PKG_DIR/Makefile"
           include \$(TOPDIR)/rules.mk
 
-          PKG_NAME:=xray-core
-          PKG_VERSION:=${XRAY_VER}
+          PKG_NAME:=openclash-core
+          PKG_VERSION:=${MIHOMO_VER}
           PKG_RELEASE:=1
 
-          PKG_SOURCE:=Xray-linux-arm64-v8a.zip
-          PKG_SOURCE_URL:=https://github.com/XTLS/Xray-core/releases/download/v\$(PKG_VERSION)/
+          PKG_SOURCE:=mihomo-linux-arm64-v\$(PKG_VERSION).gz
+          PKG_SOURCE_URL:=https://github.com/MetaCubeX/mihomo/releases/download/v\$(PKG_VERSION)/
           PKG_HASH:=skip
+
+          PKG_BUILD_DIR:=\$(BUILD_DIR)/\$(PKG_NAME)
 
           include \$(INCLUDE_DIR)/package.mk
 
-          define Package/xray-core
+          define Package/openclash-core
             SECTION:=net
             CATEGORY:=Network
-            TITLE:=A unified platform for anti-censorship (Official Prebuilt)
-            URL:=https://github.com/XTLS/Xray-core
-            DEPENDS:=+ca-bundle
+            TITLE:=Mihomo Meta core for OpenClash
+            URL:=https://github.com/MetaCubeX/mihomo
+            DEPENDS:=+luci-app-openclash
           endef
 
           define Build/Prepare
           	mkdir -p \$(PKG_BUILD_DIR)
-          	unzip -q -o \$(DL_DIR)/\$(PKG_SOURCE) -d \$(PKG_BUILD_DIR)/
+          	gzip -dc \$(DL_DIR)/\$(PKG_SOURCE) > \$(PKG_BUILD_DIR)/clash_meta
+          	chmod 0755 \$(PKG_BUILD_DIR)/clash_meta
           endef
 
           define Build/Compile
           endef
 
-          define Package/xray-core/install
-          	\$(INSTALL_DIR) \$(1)/usr/bin
-          	\$(INSTALL_BIN) \$(PKG_BUILD_DIR)/xray \$(1)/usr/bin/xray
+          define Package/openclash-core/install
+          	\$(INSTALL_DIR) \$(1)/etc/openclash/core
+          	\$(INSTALL_BIN) \$(PKG_BUILD_DIR)/clash_meta \$(1)/etc/openclash/core/clash_meta
           endef
 
-          \$(eval \$(call BuildPackage,xray-core))
+          \$(eval \$(call BuildPackage,openclash-core))
           EOF
-          sed -i 's/^          //' "$XRAY_PKG_DIR/Makefile"
-
-          ./scripts/feeds update -i
-          ./scripts/feeds install -f xray-core
+          sed -i 's/^          //' "$PKG_DIR/Makefile"
 
       - name: Load config and verify selections
         run: |
@@ -184,17 +184,23 @@ jobs:
           chk_on CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_h3c_magic-nx30-pro-nmbm "NX30 Pro NMBM 设备未被选中"
           chk_on CONFIG_TARGET_PER_DEVICE_ROOTFS "未按设备裁剪 rootfs"
 
-          echo "=== 2. 代理组件（PassWall 2 + Xray-Only）==="
-          chk_on CONFIG_PACKAGE_luci-app-passwall2 "PassWall 2 界面缺失"
-          chk_on CONFIG_PACKAGE_xray-core "Xray 核心缺失"
-          chk_on CONFIG_PACKAGE_v2ray-geoip "geoip 缺失"
-          chk_on CONFIG_PACKAGE_v2ray-geosite "geosite 缺失"
-          chk_on CONFIG_PACKAGE_geoview "geoview 缺失"
+          echo "=== 2. 代理组件（OpenClash + Mihomo）==="
+          chk_on CONFIG_PACKAGE_luci-app-openclash "OpenClash 界面缺失"
+          chk_on CONFIG_PACKAGE_openclash-core "Mihomo 内核缺失，OpenClash 无法启动"
+          chk_on CONFIG_PACKAGE_dnsmasq-full "OpenClash 强依赖 dnsmasq-full"
+          chk_on CONFIG_PACKAGE_ruby "OpenClash 的订阅转换依赖 ruby"
+          chk_on CONFIG_PACKAGE_ruby-yaml "OpenClash 依赖 ruby-yaml"
 
-          # 确保旧版 PassWall 与 Sing-box 彻底关闭
+          # 旧代理插件不应再被任何依赖拉回来
           chk_off CONFIG_PACKAGE_luci-app-passwall "旧版 PassWall 必须关闭"
+          chk_off CONFIG_PACKAGE_luci-app-passwall2 "PassWall 2 必须关闭"
+          chk_off CONFIG_PACKAGE_xray-core "Xray 已随 PassWall 一并移除"
           chk_off CONFIG_PACKAGE_sing-box "Sing-Box 必须关闭"
-          chk_off CONFIG_PACKAGE_luci-app-passwall2_INCLUDE_SingBox "PassWall 2 的 Sing-box 支持必须关闭"
+
+          echo "=== 2b. VPN 组网（Tailscale）==="
+          chk_on CONFIG_PACKAGE_tailscale "Tailscale 主程序缺失"
+          chk_off CONFIG_PACKAGE_zerotier "已改用 Tailscale"
+          chk_off CONFIG_PACKAGE_luci-app-zerotier "已改用 Tailscale"
 
           echo "=== 3. 透明代理内核模块 ==="
           for k in kmod-nft-socket kmod-nft-tproxy kmod-nft-nat; do
@@ -237,8 +243,9 @@ jobs:
           BIN=bin/targets/mediatek/filogic
           ls -lh $BIN/*h3c_magic-nx30-pro-nmbm* || true
 
-          find bin/ -name "xray-core_*.ipk" -print -quit | grep -q . || { echo "::error::xray-core 未编出"; exit 1; }
-          find bin/ -name "luci-app-passwall2_*.ipk" -print -quit | grep -q . || { echo "::error::passwall2 未编出"; exit 1; }
+          find bin/ -name "luci-app-openclash_*.ipk" -print -quit | grep -q . || { echo "::error::luci-app-openclash 未编出"; exit 1; }
+          find bin/ -name "openclash-core_*.ipk" -print -quit | grep -q . || { echo "::error::Mihomo 内核未编出"; exit 1; }
+          find bin/ -name "tailscale_*.ipk" -print -quit | grep -q . || { echo "::error::tailscale 未编出"; exit 1; }
           echo "产物核实通过！"
 
       - name: Upload firmware
@@ -263,8 +270,9 @@ jobs:
           body: |
             基于 ImmortalWrt ${{ env.SRC_TAG }} 编译的 H3C Magic NX30 Pro（NMBM 布局）固件。
 
-            - **代理插件**：全面升级至 **PassWall 2**，仅包含最新版 **Xray-core**。
-            - **内核优化**：彻底剔除 Sing-Box，固化 geoview 与 v2ray-geodata，开箱支持分流与 FakeDNS。
+            - **代理插件**：**OpenClash**，预装官方最新 **Mihomo（Meta）内核**，开箱可用。
+            - **VPN 组网**：**Tailscale**（已预装，默认未启用，用 `tailscale up` 加入网络）。
+            - **DNS**：`dnsmasq-full`，支持 OpenClash 的 nftset 分流。
           prerelease: false
           files: |
             openwrt/bin/targets/mediatek/filogic/*h3c_magic-nx30-pro-nmbm*
