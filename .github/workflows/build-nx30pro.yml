@@ -98,61 +98,6 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-          # 注入 Mihomo 内核（OpenClash 的 feeds 包只带界面与脚本，不含核心二进制）
-          # 与上一版注入 Xray 的做法一致：直接取官方预编译产物，绕开 Go 工具链。
-          MIHOMO_TAG=$(curl -sL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -r '.tag_name // empty')
-          if [ -z "$MIHOMO_TAG" ]; then
-            MIHOMO_TAG="v1.19.32"
-            echo "::warning::GitHub API 未返回最新 tag，回退到 ${MIHOMO_TAG}"
-          fi
-          MIHOMO_VER="${MIHOMO_TAG#v}"
-          echo "检测到 Mihomo 官方最新版本: ${MIHOMO_VER}"
-
-          PKG_DIR=package/openclash-core
-          rm -rf "$PKG_DIR"
-          mkdir -p "$PKG_DIR"
-
-          cat << EOF > "$PKG_DIR/Makefile"
-          include \$(TOPDIR)/rules.mk
-
-          PKG_NAME:=openclash-core
-          PKG_VERSION:=${MIHOMO_VER}
-          PKG_RELEASE:=1
-
-          PKG_SOURCE:=mihomo-linux-arm64-v\$(PKG_VERSION).gz
-          PKG_SOURCE_URL:=https://github.com/MetaCubeX/mihomo/releases/download/v\$(PKG_VERSION)/
-          PKG_HASH:=skip
-
-          PKG_BUILD_DIR:=\$(BUILD_DIR)/\$(PKG_NAME)
-
-          include \$(INCLUDE_DIR)/package.mk
-
-          define Package/openclash-core
-            SECTION:=net
-            CATEGORY:=Network
-            TITLE:=Mihomo Meta core for OpenClash
-            URL:=https://github.com/MetaCubeX/mihomo
-            DEPENDS:=+luci-app-openclash
-          endef
-
-          define Build/Prepare
-          	mkdir -p \$(PKG_BUILD_DIR)
-          	gzip -dc \$(DL_DIR)/\$(PKG_SOURCE) > \$(PKG_BUILD_DIR)/clash_meta
-          	chmod 0755 \$(PKG_BUILD_DIR)/clash_meta
-          endef
-
-          define Build/Compile
-          endef
-
-          define Package/openclash-core/install
-          	\$(INSTALL_DIR) \$(1)/etc/openclash/core
-          	\$(INSTALL_BIN) \$(PKG_BUILD_DIR)/clash_meta \$(1)/etc/openclash/core/clash_meta
-          endef
-
-          \$(eval \$(call BuildPackage,openclash-core))
-          EOF
-          sed -i 's/^          //' "$PKG_DIR/Makefile"
-
       - name: Load config and verify selections
         run: |
           cd openwrt
@@ -184,27 +129,34 @@ jobs:
           chk_on CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_h3c_magic-nx30-pro-nmbm "NX30 Pro NMBM 设备未被选中"
           chk_on CONFIG_TARGET_PER_DEVICE_ROOTFS "未按设备裁剪 rootfs"
 
-          echo "=== 2. 代理组件（OpenClash + Mihomo）==="
-          chk_on CONFIG_PACKAGE_luci-app-openclash "OpenClash 界面缺失"
-          chk_on CONFIG_PACKAGE_openclash-core "Mihomo 内核缺失，OpenClash 无法启动"
-          chk_on CONFIG_PACKAGE_dnsmasq-full "OpenClash 强依赖 dnsmasq-full"
-          chk_on CONFIG_PACKAGE_ruby "OpenClash 的订阅转换依赖 ruby"
-          chk_on CONFIG_PACKAGE_ruby-yaml "OpenClash 依赖 ruby-yaml"
+          echo "=== 2. 流量统计与单设备限速 ==="
+          chk_on CONFIG_PACKAGE_nlbwmon "按设备流量统计缺失"
+          chk_on CONFIG_PACKAGE_luci-app-nlbwmon "nlbwmon 界面缺失"
+          chk_on CONFIG_PACKAGE_kmod-nf-conntrack-netlink "nlbwmon 的内核计费接口缺失"
+          chk_on CONFIG_PACKAGE_nft-qos "单设备限速缺失"
+          chk_on CONFIG_PACKAGE_luci-app-nft-qos "nft-qos 界面缺失"
+          chk_on CONFIG_PACKAGE_kmod-nft-netdev "nft-qos 依赖的 netdev 模块缺失"
+          chk_on CONFIG_PACKAGE_kmod-nft-bridge "按 MAC 限速依赖的 bridge 模块缺失"
 
           # 旧代理插件不应再被任何依赖拉回来
           chk_off CONFIG_PACKAGE_luci-app-passwall "旧版 PassWall 必须关闭"
           chk_off CONFIG_PACKAGE_luci-app-passwall2 "PassWall 2 必须关闭"
-          chk_off CONFIG_PACKAGE_xray-core "Xray 已随 PassWall 一并移除"
+          chk_off CONFIG_PACKAGE_luci-app-openclash "OpenClash 已移除"
+          chk_off CONFIG_PACKAGE_xray-core "Xray 已移除"
           chk_off CONFIG_PACKAGE_sing-box "Sing-Box 必须关闭"
 
-          echo "=== 2b. VPN 组网（Tailscale）==="
+          echo "=== 2b. VPN 与运维 ==="
           chk_on CONFIG_PACKAGE_tailscale "Tailscale 主程序缺失"
+          chk_on CONFIG_PACKAGE_luci-app-wol "WoL 界面缺失"
+          chk_on CONFIG_PACKAGE_etherwake "WoL 依赖的 etherwake 缺失"
+          chk_on CONFIG_PACKAGE_luci-app-watchcat "watchcat 界面缺失"
+          chk_on CONFIG_PACKAGE_watchcat "watchcat 主程序缺失"
           chk_off CONFIG_PACKAGE_zerotier "已改用 Tailscale"
           chk_off CONFIG_PACKAGE_luci-app-zerotier "已改用 Tailscale"
 
-          echo "=== 3. 透明代理内核模块 ==="
+          echo "=== 3. 网络内核模块 ==="
           for k in kmod-nft-socket kmod-nft-tproxy kmod-nft-nat; do
-            chk_on "CONFIG_PACKAGE_$k" "TProxy 模块缺失"
+            chk_on "CONFIG_PACKAGE_$k" "网络相关内核模块缺失"
           done
 
           if [ "$fail" != "0" ]; then
@@ -243,8 +195,8 @@ jobs:
           BIN=bin/targets/mediatek/filogic
           ls -lh $BIN/*h3c_magic-nx30-pro-nmbm* || true
 
-          find bin/ -name "luci-app-openclash_*.ipk" -print -quit | grep -q . || { echo "::error::luci-app-openclash 未编出"; exit 1; }
-          find bin/ -name "openclash-core_*.ipk" -print -quit | grep -q . || { echo "::error::Mihomo 内核未编出"; exit 1; }
+          find bin/ -name "nlbwmon_*.ipk" -print -quit | grep -q . || { echo "::error::nlbwmon 未编出"; exit 1; }
+          find bin/ -name "nft-qos_*.ipk" -print -quit | grep -q . || { echo "::error::nft-qos 未编出"; exit 1; }
           find bin/ -name "tailscale_*.ipk" -print -quit | grep -q . || { echo "::error::tailscale 未编出"; exit 1; }
           echo "产物核实通过！"
 
@@ -270,9 +222,10 @@ jobs:
           body: |
             基于 ImmortalWrt ${{ env.SRC_TAG }} 编译的 H3C Magic NX30 Pro（NMBM 布局）固件。
 
-            - **代理插件**：**OpenClash**，预装官方最新 **Mihomo（Meta）内核**，开箱可用。
+            - **流量统计**：`nlbwmon`，按设备统计每日/每月用量（数据库默认在内存，重启清零）。
+            - **单设备限速**：`nft-qos`，支持按 IP 或 MAC 限制上下行速率。
             - **VPN 组网**：**Tailscale**（已预装，默认未启用，用 `tailscale up` 加入网络）。
-            - **DNS**：`dnsmasq-full`，支持 OpenClash 的 nftset 分流。
+            - **运维**：Wake-on-LAN 网页唤醒、watchcat 断线自动重启。
           prerelease: false
           files: |
             openwrt/bin/targets/mediatek/filogic/*h3c_magic-nx30-pro-nmbm*
